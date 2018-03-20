@@ -18,6 +18,7 @@ from threading import Condition
 import logging
 from collections import deque
 from collections import namedtuple
+from collections import OrderedDict
 
 from sawtooth_validator.protobuf.transaction_pb2 import TransactionHeader
 
@@ -413,6 +414,46 @@ class PredecessorTree:
         return predecessors
 
 
+class PredecessorChain(object):
+
+    def __init__(self):
+        self._predecessors_by_id = dict()
+
+    def add_relationship(self, txn_id, predecessors):
+        """Add a predecessor-successor relationship between one txn id and
+        a set of predecessors.
+
+        Args:
+            txn_id (str): The transaction id of the transaction.
+            predecessors (set): The transaction ids of the
+                transaction's predecessors
+
+        Returns:
+            None
+        """
+
+        all_pred = set(predecessors)
+        for pred in predecessors:
+            all_pred.update(self._predecessors_by_id[pred])
+
+        self._predecessors_by_id[txn_id] = all_pred
+
+    def is_predecessor_of_other(self, predecessor, others):
+        """Returns whether the predecessor is a predecessor or a predecessor
+        of a predecessor...of any of the others.
+
+        Args:
+            predecessor (str): The txn id of the predecessor.
+            others (list(str)): The txn id of the successor.
+
+        Returns:
+            (bool)
+
+        """
+
+        return any(predecessor in self._predecessors_by_id[o] for o in others)
+
+
 class ParallelScheduler(Scheduler):
     def __init__(self, squash_handler, first_state_hash, always_persist):
         self._squash = squash_handler
@@ -423,6 +464,8 @@ class ParallelScheduler(Scheduler):
         self._txn_predecessors = {}
 
         self._always_persist = always_persist
+
+        self._predecessor_chain = PredecessorChain()
 
         # Transaction identifiers which have been scheduled.  Stored as a list,
         # since order is important; SchedulerIterator instances, for example,
@@ -456,7 +499,7 @@ class ParallelScheduler(Scheduler):
         # Transaction results
         self._txn_results = {}
 
-        self._txns_available = []
+        self._txns_available = OrderedDict()
         self._transactions = {}
 
         self._cancelled = False
@@ -508,7 +551,7 @@ class ParallelScheduler(Scheduler):
                 _AnnotatedBatch(batch, required=required, preserve=preserve)
             for txn in batch.transactions:
                 self._batches_by_txn_id[txn.header_signature] = batch
-                self._txns_available.append(txn)
+                self._txns_available[txn.header_signature] = txn
                 self._transactions[txn.header_signature] = txn
 
             if state_hash is not None:
@@ -532,6 +575,9 @@ class ParallelScheduler(Scheduler):
                 txn_id = txn.header_signature
                 # Update our internal state with the computed predecessors.
                 self._txn_predecessors[txn_id] = set(predecessors)
+                self._predecessor_chain.add_relationship(
+                    txn_id=txn_id,
+                    predecessors=predecessors)
 
                 # Update the predecessor tree.
                 #
@@ -684,7 +730,9 @@ class ParallelScheduler(Scheduler):
     def _is_predecessor_of_possible_successor(self,
                                               txn_id,
                                               possible_successor):
-        return txn_id in self._txn_predecessors[possible_successor]
+        return self._predecessor_chain.is_predecessor_of_other(
+            txn_id,
+            [possible_successor])
 
     def _txn_has_result(self, txn_id):
         return txn_id in self._txn_results
@@ -738,16 +786,16 @@ class ParallelScheduler(Scheduler):
                     if self._txn_has_result(poss_successor):
                         del self._txn_results[poss_successor]
                         self._scheduled.remove(poss_successor)
-                        self._txns_available.append(
-                            self._transactions[poss_successor])
+                        self._txns_available[poss_successor] = \
+                            self._transactions[poss_successor]
                     else:
                         self._outstanding.add(poss_successor)
                     seen.append(poss_successor)
 
     def _reschedule_if_outstanding(self, txn_signature):
         if txn_signature in self._outstanding:
-            self._txns_available.append(
-                self._transactions[txn_signature])
+            self._txns_available[txn_signature] = \
+                self._transactions[txn_signature]
             self._scheduled.remove(txn_signature)
             self._outstanding.discard(txn_signature)
             return True
@@ -830,10 +878,6 @@ class ParallelScheduler(Scheduler):
 
             self._condition.notify_all()
 
-    def _unscheduled_transactions(self):
-
-        return self._txns_available.copy()
-
     def _has_predecessors(self, txn_id):
         for predecessor_id in self._txn_predecessors[txn_id]:
             if predecessor_id not in self._txn_results:
@@ -870,27 +914,6 @@ class ParallelScheduler(Scheduler):
             for sig in set(self._txn_results).intersection(
                 (txn.header_signature for txn in batch.transactions)))
 
-    def _predecessor_not_in_chain(self,
-                                  prior_txn_id,
-                                  chain):
-        """
-
-        Args:
-            prior_txn_id (str): The predecessor's txn header_signature.
-            chain (list): The txn_ids whose context_ids have already been
-                added.
-
-        Returns:
-            (bool): The prior_txn_id has not had its state added yet.
-        """
-
-        for pred_id in chain:
-            if (prior_txn_id in self._txn_predecessors[pred_id] or
-                prior_txn_id in chain) and \
-                    self._txn_is_in_valid_batch(pred_id):
-                return False
-        return True
-
     def _get_initial_state_for_transaction(self, txn):
         # Collect contexts that this transaction depends upon
         # We assume that all prior txns in the batch are valid
@@ -900,28 +923,20 @@ class ParallelScheduler(Scheduler):
         # dependencies that could have failed this txn did so.
         contexts = []
         txn_dependencies = deque()
-        predecessors = self._txn_predecessors[txn.header_signature]
-        txn_dependencies.extend(self._sort_txn_ids_in_reverse(
-            predecessors))
-        in_chain = []
+        txn_dependencies.extend(self._txn_predecessors[txn.header_signature])
         while txn_dependencies:
             prior_txn_id = txn_dependencies.popleft()
             if self._txn_is_in_valid_batch(prior_txn_id):
                 result = self._txn_results[prior_txn_id]
-                if self._predecessor_not_in_chain(
-                        prior_txn_id,
-                        in_chain):
-                    in_chain.append(prior_txn_id)
-                    contexts.append(result.context_id)
+                if (prior_txn_id, result.context_id) not in contexts:
+                    contexts.append((prior_txn_id, result.context_id))
             else:
-                predecessors_sorted = self._sort_txn_ids_in_reverse(
-                    self._txn_predecessors[prior_txn_id])
-                txn_dependencies.extend(predecessors_sorted)
-        return contexts
+                txn_dependencies.extend(self._txn_predecessors[prior_txn_id])
 
-    def _sort_txn_ids_in_reverse(self, txn_ids):
-        return sorted(txn_ids,
-                      key=self._index_of_txn_in_schedule, reverse=True)
+        contexts.sort(
+            key=lambda x: self._index_of_txn_in_schedule(x[0]),
+            reverse=True)
+        return [c_id for _, c_id in contexts]
 
     def _index_of_txn_in_schedule(self, txn_id):
         batch = self._batches_by_txn_id[txn_id]
@@ -947,9 +962,10 @@ class ParallelScheduler(Scheduler):
             # is not blocked by a dependency.
 
             next_txn = None
-            for txn in self._unscheduled_transactions():
-                txn_id = txn.header_signature
 
+            no_longer_available = []
+
+            for txn_id, txn in self._txns_available.items():
                 if (self._has_predecessors(txn_id)
                         or self._is_outstanding(txn_id)):
                     continue
@@ -962,7 +978,7 @@ class ParallelScheduler(Scheduler):
                     continue
 
                 if self._txn_failed_by_dep(deps):
-                    self._txns_available.remove(txn)
+                    no_longer_available.append(txn_id)
                     self._txn_results[txn_id] = \
                         TxnExecutionResult(
                             signature=txn_id,
@@ -975,11 +991,14 @@ class ParallelScheduler(Scheduler):
                         self._can_fail_fast(txn_id):
                     self._txn_results[txn_id] = \
                         TxnExecutionResult(False, None, None)
-                    self._txns_available.remove(txn)
+                    no_longer_available.append(txn_id)
                     continue
 
                 next_txn = txn
                 break
+
+            for txn_id in no_longer_available:
+                del self._txns_available[txn_id]
 
             if next_txn is not None:
                 bases = self._get_initial_state_for_transaction(next_txn)
@@ -989,7 +1008,7 @@ class ParallelScheduler(Scheduler):
                     state_hash=self._first_state_hash,
                     base_context_ids=bases)
                 self._scheduled.append(next_txn.header_signature)
-                self._txns_available.remove(next_txn)
+                del self._txns_available[next_txn.header_signature]
                 self._scheduled_txn_info[next_txn.header_signature] = info
                 return info
             return None
@@ -1025,8 +1044,8 @@ class ParallelScheduler(Scheduler):
             # is not blocked by a dependency.
 
             count = 0
-            for txn in self._unscheduled_transactions():
-                if not self._has_predecessors(txn.header_signature):
+            for txn_id in self._txns_available:
+                if not self._has_predecessors(txn_id):
                     count += 1
 
             return count
@@ -1035,8 +1054,8 @@ class ParallelScheduler(Scheduler):
         incomplete_batches = set()
         with self._condition:
             # These transactions have never been scheduled.
-            for txn in self._unscheduled_transactions():
-                batch = self._batches_by_txn_id[txn.header_signature]
+            for txn_id, txn in self._txns_available.items():
+                batch = self._batches_by_txn_id[txn_id]
                 batch_id = batch.header_signature
 
                 annotated_batch = self._batches_by_id[batch_id]
@@ -1067,8 +1086,8 @@ class ParallelScheduler(Scheduler):
                     if txn_id in self._txn_results:
                         del self._txn_results[txn_id]
 
-                    if txn in self._txns_available:
-                        self._txns_available.remove(txn)
+                    if txn_id in self._txns_available:
+                        del self._txns_available[txn_id]
 
                     if txn_id in self._outstanding:
                         self._outstanding.remove(txn_id)

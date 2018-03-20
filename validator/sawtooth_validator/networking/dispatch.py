@@ -18,7 +18,6 @@ import logging
 from threading import Condition
 import queue
 import uuid
-import functools
 
 from sawtooth_validator.concurrent.thread import InstrumentedThread
 from sawtooth_validator.networking.interconnect import get_enum_name
@@ -103,10 +102,10 @@ class Dispatcher(InstrumentedThread):
             LOGGER.debug("Removed send_message function "
                          "for connection %s", connection)
         else:
-            LOGGER.debug("Attempted to remove send_message "
-                         "function for connection %s, but no "
-                         "send_message function was registered",
-                         connection)
+            LOGGER.warning("Attempted to remove send_message "
+                           "function for connection %s, but no "
+                           "send_message function was registered",
+                           connection)
 
     def remove_send_last_message(self, connection):
         """Removes a send_last_message function previously registered
@@ -121,10 +120,10 @@ class Dispatcher(InstrumentedThread):
             LOGGER.debug("Removed send_last_message function "
                          "for connection %s", connection)
         else:
-            LOGGER.debug("Attempted to remove send_last_message "
-                         "function for connection %s, but no "
-                         "send_last_message function was registered",
-                         connection)
+            LOGGER.warning("Attempted to remove send_last_message "
+                           "function for connection %s, but no "
+                           "send_last_message function was registered",
+                           connection)
 
     def dispatch(self, connection, message, connection_id):
         if message.message_type in self._msg_type_handlers:
@@ -167,102 +166,100 @@ class Dispatcher(InstrumentedThread):
     def _process(self, message_id):
         _, connection_id, \
             message, collection = self._message_information[message_id]
+
         try:
             handler_manager = next(collection)
-            future = handler_manager.execute(connection_id, message.content)
-
-            timer_tag = type(handler_manager.handler).__name__
-            timer_ctx = self._get_dispatch_timer(timer_tag).time()
-
-            def do_next(timer_ctx, future):
-                timer_ctx.stop()
-                try:
-                    self._determine_next(message_id, future)
-                except Exception:  # pylint: disable=broad-except
-                    LOGGER.exception(
-                        "Unhandled exception while determining next")
-
-            future.add_done_callback(functools.partial(do_next, timer_ctx))
         except IndexError:
             # IndexError is raised if done with handlers
             del self._message_information[message_id]
+            return
 
-    def _determine_next(self, message_id, future):
-        try:
-            res = future.result(timeout=self._timeout)
-        except TimeoutError:
-            LOGGER.exception("Dispatcher timeout waiting on handler result.")
-            raise
+        timer_tag = type(handler_manager.handler).__name__
+        timer_ctx = self._get_dispatch_timer(timer_tag).time()
 
-        if res is None:
+        def do_next(result):
+            timer_ctx.stop()
+            try:
+                self._determine_next(message_id, result)
+            except Exception:  # pylint: disable=broad-except
+                LOGGER.exception(
+                    "Unhandled exception while determining next")
+
+        handler_manager.execute(connection_id, message.content, do_next)
+
+    def _determine_next(self, message_id, result):
+        if result is None:
             LOGGER.debug('Ignoring None handler result, likely due to an '
                          'unhandled error while executing the handler')
             return
 
-        if res.status == HandlerStatus.DROP:
+        if result.status == HandlerStatus.DROP:
             del self._message_information[message_id]
 
-        elif res.status == HandlerStatus.PASS:
+        elif result.status == HandlerStatus.PASS:
             self._process(message_id)
 
-        elif res.status == HandlerStatus.RETURN_AND_PASS:
+        elif result.status == HandlerStatus.RETURN_AND_PASS:
             connection, connection_id, \
                 original_message, _ = self._message_information[message_id]
 
-            if res.message_out and res.message_type:
+            if result.message_out and result.message_type:
                 message = validator_pb2.Message(
-                    content=res.message_out.SerializeToString(),
+                    content=result.message_out.SerializeToString(),
                     correlation_id=original_message.correlation_id,
-                    message_type=res.message_type)
+                    message_type=result.message_type)
                 try:
                     self._send_message[connection](msg=message,
                                                    connection_id=connection_id)
                 except KeyError:
-                    LOGGER.info("Can't send message %s back to "
-                                "%s because connection %s not in dispatcher",
-                                get_enum_name(message.message_type),
-                                connection_id,
-                                connection)
+                    LOGGER.warning(
+                        "Can't send message %s back to "
+                        "%s because connection %s not in dispatcher",
+                        get_enum_name(message.message_type),
+                        connection_id,
+                        connection)
+
                 self._process(message_id)
             else:
                 LOGGER.error("HandlerResult with status of RETURN_AND_PASS "
                              "is missing message_out or message_type")
 
-        elif res.status == HandlerStatus.RETURN:
+        elif result.status == HandlerStatus.RETURN:
             connection, connection_id,  \
                 original_message, _ = self._message_information[message_id]
 
             del self._message_information[message_id]
 
-            if res.message_out and res.message_type:
+            if result.message_out and result.message_type:
                 message = validator_pb2.Message(
-                    content=res.message_out.SerializeToString(),
+                    content=result.message_out.SerializeToString(),
                     correlation_id=original_message.correlation_id,
-                    message_type=res.message_type)
+                    message_type=result.message_type)
                 try:
                     self._send_message[connection](msg=message,
                                                    connection_id=connection_id)
                 except KeyError:
-                    LOGGER.info("Can't send message %s back to "
-                                "%s because connection %s not in dispatcher",
-                                get_enum_name(message.message_type),
-                                connection_id,
-                                connection)
+                    LOGGER.warning(
+                        "Can't send message %s back to "
+                        "%s because connection %s not in dispatcher",
+                        get_enum_name(message.message_type),
+                        connection_id,
+                        connection)
             else:
                 LOGGER.error("HandlerResult with status of RETURN "
                              "is missing message_out or message_type")
 
-        elif res.status == HandlerStatus.RETURN_AND_CLOSE:
+        elif result.status == HandlerStatus.RETURN_AND_CLOSE:
             connection, connection_id,  \
                 original_message, _ = self._message_information[message_id]
 
             del self._message_information[message_id]
 
-            if res.message_out and res.message_type:
+            if result.message_out and result.message_type:
                 message = validator_pb2.Message(
-                    content=res.message_out.SerializeToString(),
+                    content=result.message_out.SerializeToString(),
                     correlation_id=original_message.correlation_id,
-                    message_type=res.message_type)
+                    message_type=result.message_type)
                 try:
                     LOGGER.warning(
                         "Sending hang-up in reply to %s to connection %s",
@@ -272,11 +269,12 @@ class Dispatcher(InstrumentedThread):
                         msg=message,
                         connection_id=connection_id)
                 except KeyError:
-                    LOGGER.info("Can't send last message %s back to "
-                                "%s because connection %s not in dispatcher",
-                                get_enum_name(message.message_type),
-                                connection_id,
-                                connection)
+                    LOGGER.warning(
+                        "Can't send last message %s back to "
+                        "%s because connection %s not in dispatcher",
+                        get_enum_name(message.message_type),
+                        connection_id,
+                        connection)
             else:
                 LOGGER.error("HandlerResult with status of RETURN_AND_CLOSE "
                              "is missing message_out or message_type")
@@ -319,9 +317,11 @@ class _HandlerManager(object):
     def handler(self):
         return self._handler
 
-    def execute(self, connection_id, message):
-        return self._executor.submit(
-            self._handler.handle, connection_id, message)
+    def execute(self, connection_id, message, callback):
+        def wrapped(connection_id, message):
+            return callback(self._handler.handle(connection_id, message))
+
+        return self._executor.submit(wrapped, connection_id, message)
 
 
 class _ManagerCollection(object):
