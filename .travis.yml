@@ -1,0 +1,6 @@
+
+language: java
+# command to install dependencies
+install:
+script:
+  - sh bin/build_java_sdk
