@@ -44,7 +44,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Add sawtooth repo
-RUN echo "deb http://repo.sawtooth.me/ubuntu/ci xenial universe" >> /etc/apt/sources.list \
+RUN echo "deb [arch=amd64] http://repo.sawtooth.me/ubuntu/ci xenial universe" >> /etc/apt/sources.list \
  && apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 8AA7AF1F1091A5FD \
  && apt-get update \
  && apt-get install -y -q --allow-downgrades \
@@ -60,7 +60,6 @@ RUN echo "deb http://repo.sawtooth.me/ubuntu/ci xenial universe" >> /etc/apt/sou
     python3-async-timeout=1.2.0-1 \
     python3-bitcoin=1.1.42-1 \
     python3-cchardet=2.0a3-1 \
-    python3-chardet=2.3.0-1 \
     python3-cryptography-vectors=1.7.2-1 \
     python3-cryptography=1.7.2-1 \
     python3-grpcio-tools=1.1.3-1 \
