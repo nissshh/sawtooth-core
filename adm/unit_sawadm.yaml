@@ -1,4 +1,4 @@
-# Copyright 2016 Intel Corporation
+# Copyright 2018 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,27 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ------------------------------------------------------------------------------
-import time
 
+version: "2.1"
 
-class TimeOut(object):
-    def __init__(self, wait):
-        self.wait_time = wait
-        self.expire_time = time.time() + wait
+services:
 
-    def is_timed_out(self):
-        return time.time() > self.expire_time
-
-    def __call__(self, *args, **kwargs):
-        return time.time() > self.expire_time
-
-
-def wait_until(lbd, time_out=None):
-    end_time = None
-    if time_out is not None:
-        end_time = time.time() + time_out
-
-    while (end_time is None
-           or time.time() < end_time) and \
-            not lbd():
-        time.sleep(0.1)
+  unit-sawadm:
+    image: sawtooth-dev-rust:$ISOLATION_ID
+    volumes:
+      - $SAWTOOTH_CORE:/project/sawtooth-core
+    working_dir: /project/sawtooth-core/adm
+    command: "bash -c \"
+      mkdir /var/lib/sawtooth &&
+      RUST_BACKTRACE=1 cargo test -- --nocapture
+    \""

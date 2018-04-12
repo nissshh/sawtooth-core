@@ -208,6 +208,7 @@ test_cli() {
     copy_coverage .coverage.cli
     run_docker_test test_peer_list
     copy_coverage .coverage.peer_list
+    run_docker_test ./adm/unit_sawadm.yaml
 }
 
 test_rest_api() {
@@ -332,6 +333,7 @@ test_rust_sdk() {
     run_docker_test ./sdk/rust/unit_rust_sdk.yaml
     run_docker_test ./perf/sawtooth_workload/unit_perf_workload.yaml
     run_docker_test ./perf/intkey_workload/unit_intkey_workload.yaml
+    run_docker_test ./perf/smallbank_workload/unit_smallbank_workload.yaml
     run_docker_test ./perf/sawtooth_perf/unit_sawtooth_perf.yaml
     run_docker_test ./sdk/examples/intkey_python/tests/test_tp_intkey_rust.yaml
     run_docker_test test_intkey_smoke_rust
